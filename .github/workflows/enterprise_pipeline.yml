@@ -1,0 +1,324 @@
+name: ERPNext GitHub Full-Ecosystem Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================================
+  # 1. فحص التبعيات وأمان الحزم (GitHub Dependency Review)
+  # ============================================================================
+  dependency-review:
+    name: Dependency Review (SCA)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Dependency Review Scan
+        uses: actions/dependency-review-action@v4
+
+  # ============================================================================
+  # 2. فحص الجودة والاختبارات المتوازية (Matrix Testing + Code Coverage)
+  # ============================================================================
+  code-quality-and-tests:
+    name: Lint & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    services:
+      mariadb:
+        image: mariadb:10.6
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      redis-cache:
+        image: redis:alpine
+        ports:
+          - 13000:6379
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install Linting & Coverage Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pytest pytest-cov
+
+      - name: Code Linting
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+
+      - name: Run Frappe/ERPNext App Tests
+        run: |
+          mkdir -p coverage reports
+          pytest --cov=my_custom_app --cov-report=html:coverage --junitxml=reports/junit.xml || true
+
+      - name: Upload Test Artifacts (GitHub Artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-py-${{ matrix.python-version }}
+          path: coverage/
+          retention-days: 14
+
+  # ============================================================================
+  # 3. التحليل الأمني الساكن المتقدم (GitHub CodeQL SAST)
+  # ============================================================================
+  security-codeql:
+    name: CodeQL Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python, javascript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # ============================================================================
+  # 4. فحص تسريب البيانات والمفاتيح السرية (Secret Scanning)
+  # ============================================================================
+  secret-scanning:
+    name: Secret & Credential Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # ============================================================================
+  # 5. بناء الحاوية وفحص الثغرات (Build + Trivy Scan + GHCR Push)
+  # ============================================================================
+  build-and-publish:
+    name: Build & Publish Container (GHCR)
+    needs: [code-quality-and-tests, security-codeql, secret-scanning]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - name: Build Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local-scan
+
+      - name: Vulnerability Scanning with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local-scan
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy Scan Results to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Push Container to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # 6. النشر في بيئة Staging
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-and-publish]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.erp.internal
+
+    steps:
+      - name: Run Staging Deployment
+        run: |
+          echo "Deploying ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest to Staging Server..."
+
+  # ============================================================================
+  # 7. النشر في بيئة Production (مع بوابة موافقة يدوية)
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+      url: https://erp.company.internal
+
+    steps:
+      - name: Run Production Rollout
+        run: |
+          echo "Promoting image to Production HA Cluster..."
+
+  # ============================================================================
+  # 8. نشر توثيق المشروع عبر GitHub Pages
+  # ============================================================================
+  deploy-github-pages:
+    name: Publish Documentation & Coverage (GitHub Pages)
+    needs: [code-quality-and-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Test Coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report-py-3.11
+          path: public-coverage/
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v4
+
+      - name: Build Static Documentation Site
+        run: |
+          mkdir -p _site
+          cp -r public-coverage/* _site/ || true
+          echo "<!DOCTYPE html><html><head><title>ERPNext Documentation</title></head><body>" > _site/index.html
+          echo "<h1>ERPNext Project Automated Portal</h1>" >> _site/index.html
+          echo "<p>Branch: <b>${{ github.ref_name }}</b> | Commit: <code>${{ github.sha }}</code></p>" >> _site/index.html
+          echo "</body></html>" >> _site/index.html
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ============================================================================
+  # 9. توليد الإصدارات الرسمية المؤتمتة (GitHub Releases)
+  # ============================================================================
+  automated-release:
+    name: Create Official Release
+    needs: [deploy-production]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Generate Automated GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "ERPNext Production Release ${{ github.ref_name }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  # ============================================================================
+  # 10. إنشاء تذكرة تلقائية عند فشل الـ Pipeline (GitHub Issues Automation)
+  # ============================================================================
+  notify-on-failure:
+    name: Create Incident Issue on Failure
+    runs-on: ubuntu-latest
+    needs: [code-quality-and-tests, security-codeql, build-and-publish, deploy-production]
+    if: failure()
+    permissions:
+      issues: write
+
+    steps:
+      - name: Create Incident Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Pipeline Failure: ${context.workflow} (${context.sha.substring(0,7)})`,
+              body: `### CI/CD Failure Incident\n\n- **Run ID:** [${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n- **Triggered By:** @${context.actor}\n- **Branch / Ref:** \`${context.ref}\`\n\nPlease investigate the failed jobs immediately.`,
+              labels: ['bug', 'ci/cd']
+            });

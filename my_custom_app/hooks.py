@@ -1,0 +1,6 @@
+app_name = "my_custom_app"
+app_title = "Enterprise ERPNext App"
+app_publisher = "DevOps & Core Team"
+app_description = "Integrated Enterprise ERPNext Custom App"
+app_email = "devops@company.com"
+app_license = "mit"
